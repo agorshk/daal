@@ -496,6 +496,23 @@ void countResponses(SizeType nClasses, SizeType n, const IndexType * aIdx, const
         nSamplesPerClass[idx * nClasses + iClass] += weights;
     }
 }
+//count number of responses in case no weights
+template <typename algorithmFPType, typename ResponseType, typename IndexType, typename FeatureIndexType, typename SizeType, CpuType cpu>
+void countResponses(SizeType nClasses, SizeType n, const IndexType * aIdx, const ResponseType * aResponse, const FeatureIndexType * indexedFeature,
+                    IndexType * nFeatIdx, float * nSamplesPerClass)
+{
+    PRAGMA_VECTOR_ALWAYS
+    for (size_t i = 0; i < n; ++i)
+    {
+        const IndexType iSample              = aIdx[i];
+        const auto & r                       = aResponse[iSample];
+        const IndexType iRow                 = r.idx;
+        const IndexedFeatures::IndexType idx = indexedFeature[iRow];
+        ++nFeatIdx[idx];
+        const ClassIndexType iClass = r.val;
+        ++nSamplesPerClass[idx * nClasses + iClass];
+    }
+}
 
 template <typename algorithmFPType, CpuType cpu>
 int UnorderedRespHelper<algorithmFPType, cpu>::findBestSplitForFeatureSorted(algorithmFPType * featureBuf, IndexType iFeature, const IndexType * aIdx,
@@ -511,9 +528,13 @@ int UnorderedRespHelper<algorithmFPType, cpu>::findBestSplitForFeatureSorted(alg
     auto featWeights      = _weightsFeatureBuf.get();
     auto nSamplesPerClass = _samplesPerClassBuf.get();
 
-    countResponses<algorithmFPType, typename super::Response, IndexType, typename IndexedFeatures::IndexType, size_t, cpu>(
-        _nClasses, n, aIdx, this->_aResponse.get(), this->indexedFeatures().data(iFeature), nFeatIdx, nSamplesPerClass, featWeights,
-        this->_aWeights.get());
+    if (this->weights)
+        countResponses<algorithmFPType, typename super::Response, IndexType, typename IndexedFeatures::IndexType, size_t, cpu>(
+            _nClasses, n, aIdx, this->_aResponse.get(), this->indexedFeatures().data(iFeature), nFeatIdx, nSamplesPerClass, featWeights,
+            this->_aWeights.get());
+    else
+        countResponses<algorithmFPType, typename super::Response, IndexType, typename IndexedFeatures::IndexType, size_t, cpu>(
+            _nClasses, n, aIdx, this->_aResponse.get(), this->indexedFeatures().data(iFeature), nFeatIdx, nSamplesPerClass);
 
     algorithmFPType bestImpDecrease =
         split.impurityDecrease < 0 ? split.impurityDecrease : totalWeights * (split.impurityDecrease + algorithmFPType(1.) - curImpurity.var);
@@ -527,8 +548,9 @@ int UnorderedRespHelper<algorithmFPType, cpu>::findBestSplitForFeatureSorted(alg
     for (size_t i = 0; i < nDiffFeatMax; ++i)
     {
         if (!nFeatIdx[i]) continue;
-        nLeft       = (split.featureUnordered ? nFeatIdx[i] : nLeft + nFeatIdx[i]);
-        leftWeights = (split.featureUnordered ? featWeights[i] : leftWeights + featWeights[i]);
+        nLeft = (split.featureUnordered ? nFeatIdx[i] : nLeft + nFeatIdx[i]);
+        if (this->_weights) leftWeights = (split.featureUnordered ? featWeights[i] : leftWeights + featWeights[i]);
+        else leftWeights = algorithmFPType(nLeft);
         if ((nLeft == n) //last split
             || ((n - nLeft) < nMinSplitPart) || ((totalWeights - leftWeights) < minWeightLeaf))
             break;
@@ -612,11 +634,11 @@ int UnorderedRespHelper<algorithmFPType, cpu>::findBestSplitForFeatureSorted(alg
     auto nSamplesPerClass = _samplesPerClassBuf.get();
 
     //direct access to sorted features data in order to facilitate vectorization
-    const IndexedFeatures::IndexType * const indexedFeature = this->indexedFeatures().data(iFeature);
-    const auto aResponse                                    = this->_aResponse.get();
-    const auto aWeights                                     = this->_aWeights.get();
-
+    if (this->_weights)
     {
+        const IndexedFeatures::IndexType * const indexedFeature = this->indexedFeatures().data(iFeature);
+        const auto aResponse                                    = this->_aResponse.get();
+        const auto aWeights                                     = this->_aWeights.get();
         PRAGMA_VECTOR_ALWAYS
         for (size_t i = 0; i < n; ++i)
         {
@@ -628,6 +650,21 @@ int UnorderedRespHelper<algorithmFPType, cpu>::findBestSplitForFeatureSorted(alg
             ++nFeatIdx[idx];
             featWeights[idx] += weights; //use for calculate leftWeights
             nSamplesPerClass[idx * _nClasses + iClass] += weights;
+        }
+    }
+    else
+    {
+        const IndexedFeatures::IndexType * const indexedFeature = this->indexedFeatures().data(iFeature);
+        const auto aResponse                                    = this->_aResponse.get();
+        PRAGMA_VECTOR_ALWAYS
+        for (size_t i = 0; i < n; ++i)
+        {
+            const IndexType iSample              = aIdx[i];
+            const auto & r                       = aResponse[iSample];
+            const IndexedFeatures::IndexType idx = indexedFeature[r.idx];
+            ++nFeatIdx[idx];
+            const ClassIndexType iClass = r.val;
+            ++nSamplesPerClass[idx * _nClasses + iClass];
         }
     }
     algorithmFPType bestImpDecrease =
@@ -642,8 +679,9 @@ int UnorderedRespHelper<algorithmFPType, cpu>::findBestSplitForFeatureSorted(alg
     for (size_t i = 0; i < nDiffFeatMax; ++i)
     {
         if (!nFeatIdx[i]) continue;
-        nLeft       = (split.featureUnordered ? nFeatIdx[i] : nLeft + nFeatIdx[i]);
-        leftWeights = (split.featureUnordered ? featWeights[i] : leftWeights + featWeights[i]);
+        nLeft = (split.featureUnordered ? nFeatIdx[i] : nLeft + nFeatIdx[i]);
+        if (this->_weights) leftWeights = (split.featureUnordered ? featWeights[i] : leftWeights + featWeights[i]);
+        else leftWeights = algorithmFPType(nLeft);
         if ((nLeft == n) //last split
             || ((n - nLeft) < nMinSplitPart) || ((totalWeights - leftWeights) < minWeightLeaf))
             break;
