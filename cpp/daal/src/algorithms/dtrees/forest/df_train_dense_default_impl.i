@@ -381,13 +381,14 @@ services::Status computeImpl(HostAppIface * pHostApp, const NumericTable * x, co
 
     //use tls in case of multiple threads
     const bool bThreaded = (threader_get_max_threads_number() > 1) && (par.nTrees > 1);
-    daal::tls<Ctx *> tlsCtx([&]() -> Ctx * {
+    daal::ls<Ctx *> tlsCtx([&]() -> Ctx * {
         //in case of single thread no need to allocate
         return (bThreaded ? createTlsContext<algorithmFPType, cpu, Ctx>(x, par, nClasses) : &mainCtx);
     });
-    daal::tls<TaskType *> tlsTask([&]() -> TaskType * {
+    daal::ls<TaskType *> tlsTask([&]() -> TaskType * {
         //in case of single thread no need to allocate
         Ctx * ctx = tlsCtx.local();
+        DAAL_LS_RELEASE(Ctx, tlsCtx, ctx);
         return ctx ? new TaskType(pHostApp, x, y, w, par, featTypes, par.memorySavingMode ? nullptr : &indexedFeatures, binIndex, *ctx, nClasses) :
                      nullptr;
     });
@@ -411,6 +412,7 @@ services::Status computeImpl(HostAppIface * pHostApp, const NumericTable * x, co
         if (!safeStat.ok()) return;
         TaskType * task = tlsTask.local();
         DAAL_CHECK_MALLOC_THR(task);
+        DAAL_LS_RELEASE(TaskType, tlsTask, task);
         dtrees::internal::Tree * pTree = nullptr;
         numElems[i]                    = 0;
         auto engineImpl                = dynamic_cast<engines::internal::BatchBaseImpl *>(engines[i].get());
@@ -431,7 +433,7 @@ services::Status computeImpl(HostAppIface * pHostApp, const NumericTable * x, co
             service_scalable_free<byte, cpu>((byte *)ctx);
         }
     });
-    tlsTask.parallel_reduce([&](TaskType * task) -> void {
+    tlsTask.reduce([&](TaskType * task) -> void {
         delete task;
         task = nullptr;
     });
@@ -482,10 +484,10 @@ protected:
           _nClasses(nClasses),
           _nSamples(par.observationsPerTreeFraction * x->getNumberOfRows()),
           _nFeaturesPerNode(par.featuresPerNode),
-          _helper(indexedFeatures, nClasses),
+          _helper(indexedFeatures, nClasses, (par.featuresPerNode > 4) ? 4 : par.featuresPerNode),
           _binIndex(binIndex),
           _impurityThreshold(_par.impurityThreshold),
-          _nFeatureBufs(1), //for sequential processing
+          _nFeatureBufs((par.featuresPerNode > 4) ? 4 : par.featuresPerNode), //1 for sequential processing,
           _featHelper(featTypes),
           _threadCtx(threadCtx),
           _accuracy(daal::services::internal::EpsilonVal<algorithmFPType>::get()),
@@ -1043,7 +1045,7 @@ bool TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::findBes
             //index of best feature value in the array of sorted feature values
             const int idxFeatureValue =
                 _helper.findBestSplitForFeatureSorted(featureBuf(0), iFeature, aIdx, n, _par.minObservationsInLeafNode, curImpurity, split,
-                                                      _minWeightLeaf, totalWeights, _binIndex + _data->getNumberOfRows() * iFeature);
+                                                      _minWeightLeaf, totalWeights, _binIndex + _data->getNumberOfRows() * iFeature, 0);
             if (idxFeatureValue < 0) continue;
             iBestSplit = i;
             split.copyTo(bestSplit);
@@ -1060,7 +1062,7 @@ bool TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::findBes
 #endif
             split.featureUnordered = _featHelper.isUnordered(iFeature);
             if (!_helper.findBestSplitForFeature(featBuf, aIdx, n, _par.minObservationsInLeafNode, _accuracy, curImpurity, split, _minWeightLeaf,
-                                                 totalWeights))
+                                                 totalWeights, 0))
                 continue;
             idxFeatureValueBestSplit = -1;
             iBestSplit               = i;
@@ -1109,14 +1111,116 @@ bool TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::findBes
 template <typename algorithmFPType, typename BinIndexType, typename DataHelper, CpuType cpu>
 bool TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::findBestSplitThreaded(size_t iStart, size_t n,
                                                                                                const typename DataHelper::ImpurityData & curImpurity,
-                                                                                               IndexType & iFeatureBest,
-                                                                                               typename DataHelper::TSplitData & split,
+                                                                                               IndexType & iBestFeature,
+                                                                                               typename DataHelper::TSplitData & bestSplit,
                                                                                                algorithmFPType totalWeights)
 {
     chooseFeatures();
-    TArray<typename DataHelper::TSplitData, cpu> aFeatureSplit(_nFeaturesPerNode);
-    //TODO, if parallel for features
-    return false;
+
+    const float qMax                     = 0.02; //min fracture of observations to be handled as indexed feature values
+    const float fact                     = float(n);
+    IndexType * aIdx                     = _aSample.get() + iStart;
+    int bestBlock                        = -1;
+    algorithmFPType bestImpurityDecrease = -1;
+
+    const size_t nBlocks     = _nFeatureBufs;
+    const size_t sizeOfBlock = _nFeaturesPerNode / nBlocks + !!(_nFeaturesPerNode % nBlocks);
+
+    TVector<int, cpu> iBestSplit(nBlocks, -1);
+    TVector<int, cpu> idxFeatureValueBestSplit(nBlocks, -1);
+    TVector<typename DataHelper::TSplitData, cpu> split(nBlocks);
+
+    daal::threader_for(nBlocks, nBlocks, [&](size_t iBlock) {
+        const size_t firstFeature = iBlock * sizeOfBlock;
+        const size_t lastFeature  = (((iBlock + 1) * sizeOfBlock > _nFeaturesPerNode) ? _nFeaturesPerNode : firstFeature + sizeOfBlock);
+
+        IndexType * bestSplitIdx  = featureIndexBuf(iBlock) + iStart;
+        algorithmFPType * featBuf = featureBuf(iBlock) + iStart;
+
+        for (size_t i = firstFeature; i < lastFeature; ++i)
+        {
+            const auto iFeature            = _aFeatureIdx[i];
+            const bool bUseIndexedFeatures = (!_par.memorySavingMode) && (fact > qMax * float(_helper.indexedFeatures().numIndices(iFeature)));
+
+            if (bUseIndexedFeatures)
+            {
+                if (!_helper.hasDiffFeatureValues(iFeature, aIdx, n)) continue; //all values of the feature are the same
+                split[iBlock].featureUnordered = _featHelper.isUnordered(iFeature);
+                //index of best feature value in the array of sorted feature values
+                const int idxFeatureValue = _helper.findBestSplitForFeatureSorted(
+                    featureBuf(iBlock), iFeature, aIdx, n, _par.minObservationsInLeafNode, curImpurity, split[iBlock], _minWeightLeaf, totalWeights,
+                    _binIndex + _data->getNumberOfRows() * iFeature, iBlock);
+                if (idxFeatureValue < 0) continue;
+                iBestSplit[iBlock]               = i;
+                idxFeatureValueBestSplit[iBlock] = idxFeatureValue;
+            }
+            else
+            {
+                featureValuesToBuf(iFeature, featBuf, aIdx, n);
+                if (featBuf[n - 1] - featBuf[0] <= _accuracy) //all values of the feature are the same
+                    continue;
+#ifdef DEBUG_CHECK_IMPURITY
+                _helper.checkImpurity(aIdx, n, curImpurity);
+#endif
+                split[iBlock].featureUnordered = _featHelper.isUnordered(iFeature);
+                if (!_helper.findBestSplitForFeature(featBuf, aIdx, n, _par.minObservationsInLeafNode, _accuracy, curImpurity, split[iBlock],
+                                                     _minWeightLeaf, totalWeights, iBlock))
+                    continue;
+                idxFeatureValueBestSplit[iBlock] = -1;
+                iBestSplit[iBlock]               = i;
+                DAAL_ASSERT(split[iBlock].iStart < n);
+                DAAL_ASSERT(split[iBlock].iStart + split[iBlock].nLeft <= n);
+                if (i + 1 < _nFeaturesPerNode || split[iBlock].featureUnordered) services::internal::tmemcpy<IndexType, cpu>(bestSplitIdx, aIdx, n);
+#ifdef DEBUG_CHECK_IMPURITY
+                _helper.checkImpurity(aIdx, split[iBlock].nLeft, split[iBlock].left);
+#endif
+            }
+        }
+    });
+
+    for (size_t iBlock = 0; iBlock < nBlocks; ++iBlock)
+    {
+        if (iBestSplit[iBlock] > -1 && split[iBlock].impurityDecrease > bestImpurityDecrease)
+        {
+            bestBlock            = iBlock;
+            bestImpurityDecrease = split[iBlock].impurityDecrease;
+        }
+    }
+    if (bestBlock < 0 || iBestSplit[bestBlock] < 0) return false; //not found
+    split[bestBlock].featureUnordered = _featHelper.isUnordered(_aFeatureIdx[iBestSplit[bestBlock]]);
+    split[bestBlock].copyTo(bestSplit);
+
+    iBestFeature             = _aFeatureIdx[iBestSplit[bestBlock]];
+    bool bCopyToIdx          = true;
+    IndexType * bestSplitIdx = featureIndexBuf(bestBlock) + iStart;
+
+    if (idxFeatureValueBestSplit[bestBlock] >= 0)
+    {
+        //sorted feature was used
+        //calculate impurity and get split to bestSplitIdx
+        _helper.finalizeBestSplit(aIdx, _binIndex + _data->getNumberOfRows() * iBestFeature, n, iBestFeature, idxFeatureValueBestSplit[bestBlock],
+                                  bestSplit, bestSplitIdx);
+    }
+    else if (bestSplit.featureUnordered)
+    {
+        if (bestSplit.iStart)
+        {
+            DAAL_ASSERT(bestSplit.iStart + bestSplit.nLeft <= n);
+            services::internal::tmemcpy<IndexType, cpu>(aIdx, bestSplitIdx + bestSplit.iStart, bestSplit.nLeft);
+            aIdx += bestSplit.nLeft;
+            services::internal::tmemcpy<IndexType, cpu>(aIdx, bestSplitIdx, bestSplit.iStart);
+            aIdx += bestSplit.iStart;
+            bestSplitIdx += bestSplit.iStart + bestSplit.nLeft;
+            if (n > (bestSplit.iStart + bestSplit.nLeft))
+                services::internal::tmemcpy<IndexType, cpu>(aIdx, bestSplitIdx, n - bestSplit.iStart - bestSplit.nLeft);
+            bCopyToIdx = false; //done
+        }
+    }
+    else
+        bCopyToIdx = (iBestSplit[bestBlock] + 1 < _nFeaturesPerNode); //if iBestSplit is the last considered feature
+                                                                      //then aIdx already contains the best split, no need to copy
+    if (bCopyToIdx) services::internal::tmemcpy<IndexType, cpu>(aIdx, bestSplitIdx, n);
+    return true;
 }
 
 template <typename algorithmFPType, typename BinIndexType, typename DataHelper, CpuType cpu>

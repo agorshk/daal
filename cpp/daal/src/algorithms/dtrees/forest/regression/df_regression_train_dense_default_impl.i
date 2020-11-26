@@ -96,7 +96,9 @@ public:
     typedef SplitData<algorithmFPType, ImpurityData> TSplitData;
 
 public:
-    OrderedRespHelper(const dtrees::internal::IndexedFeatures * indexedFeatures, size_t dummy) : super(indexedFeatures) {}
+    OrderedRespHelper(const dtrees::internal::IndexedFeatures * indexedFeatures, size_t dummy, size_t nFeatureBufs)
+        : super(indexedFeatures), _nFeatureBufs(nFeatureBufs)
+    {}
     virtual bool init(const NumericTable * data, const NumericTable * resp, const IndexType * aSample,
                       const NumericTable * weights) DAAL_C11_OVERRIDE;
     void convertLeftImpToRight(size_t n, const ImpurityData & total, TSplitData & split)
@@ -110,11 +112,11 @@ public:
     void calcImpurity(const IndexType * aIdx, size_t n, ImpurityData & imp, algorithmFPType & totalweights) const;
     bool findBestSplitForFeature(const algorithmFPType * featureVal, const IndexType * aIdx, size_t n, size_t nMinSplitPart,
                                  const algorithmFPType accuracy, const ImpurityData & curImpurity, TSplitData & split,
-                                 const algorithmFPType minWeightLeaf, const algorithmFPType totalWeights) const;
+                                 const algorithmFPType minWeightLeaf, const algorithmFPType totalWeights, const size_t iBlock) const;
     template <typename BinIndexType>
     int findBestSplitForFeatureSorted(algorithmFPType * featureBuf, IndexType iFeature, const IndexType * aIdx, size_t n, size_t nMinSplitPart,
                                       const ImpurityData & curImpurity, TSplitData & split, const algorithmFPType minWeightLeaf,
-                                      const algorithmFPType totalWeights, const BinIndexType * binIndex) const;
+                                      const algorithmFPType totalWeights, const BinIndexType * binIndex, const size_t iBlock) const;
 
     typedef double intermSummFPType;
     template <typename BinIndexType>
@@ -195,6 +197,8 @@ private:
     //buffer for the computation using indexed features
     mutable TVector<IndexType, cpu, DefaultAllocator<cpu> > _idxFeatureBuf;
     mutable TVector<algorithmFPType, cpu, DefaultAllocator<cpu> > _weightsFeatureBuf;
+    //number of buffers to get feature values (to process finding best split through features independently in parallel)
+    const size_t _nFeatureBufs;
 };
 
 #ifdef DEBUG_CHECK_IMPURITY
@@ -305,7 +309,8 @@ template <typename algorithmFPType, CpuType cpu>
 bool OrderedRespHelper<algorithmFPType, cpu>::findBestSplitForFeature(const algorithmFPType * featureVal, const IndexType * aIdx, size_t n,
                                                                       size_t nMinSplitPart, const algorithmFPType accuracy,
                                                                       const ImpurityData & curImpurity, TSplitData & split,
-                                                                      const algorithmFPType minWeightLeaf, const algorithmFPType totalWeights) const
+                                                                      const algorithmFPType minWeightLeaf, const algorithmFPType totalWeights,
+                                                                      const size_t iBlock) const
 {
     return split.featureUnordered ?
                findBestSplitCategoricalFeature(featureVal, aIdx, n, nMinSplitPart, accuracy, curImpurity, split, minWeightLeaf, totalWeights) :
@@ -458,7 +463,8 @@ template <typename BinIndexType>
 int OrderedRespHelper<algorithmFPType, cpu>::findBestSplitForFeatureSorted(algorithmFPType * buf, IndexType iFeature, const IndexType * aIdx,
                                                                            size_t n, size_t nMinSplitPart, const ImpurityData & curImpurity,
                                                                            TSplitData & split, const algorithmFPType minWeightLeaf,
-                                                                           const algorithmFPType totalWeights, const BinIndexType * binIndex) const
+                                                                           const algorithmFPType totalWeights, const BinIndexType * binIndex,
+                                                                           const size_t iBlock) const
 {
     const auto nDiffFeatMax = this->indexedFeatures().numIndices(iFeature);
     _idxFeatureBuf.setValues(nDiffFeatMax, 0);
